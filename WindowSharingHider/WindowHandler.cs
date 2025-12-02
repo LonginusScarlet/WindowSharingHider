@@ -1,5 +1,6 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -38,6 +39,16 @@ namespace WindowSharingHider
             public UInt32 SizeOfImage;
             public IntPtr EntryPoint;
         }
+
+        // 扩展的窗口信息类
+        public class WindowDetails
+        {
+            public IntPtr Handle { get; set; }
+            public string Title { get; set; }
+            public string ProcessName { get; set; }
+            public int ProcessId { get; set; }
+        }
+
         public static Dictionary<IntPtr, String> GetVisibleWindows()
         {
             var windows = new Dictionary<IntPtr, String>();
@@ -57,6 +68,60 @@ namespace WindowSharingHider
             }, IntPtr.Zero);
             return windows;
         }
+
+        // 获取包含进程信息的窗口列表
+        public static List<WindowDetails> GetVisibleWindowsWithDetails()
+        {
+            var windows = new List<WindowDetails>();
+            EnumWindows(delegate (IntPtr hWnd, IntPtr lParam)
+            {
+                if (!IsWindowVisible(hWnd)) return true;
+                DwmGetWindowAttribute(hWnd, 14, out Int32 pvAttribute, 4);
+                if (pvAttribute > 0) return true;
+                var length = GetWindowTextLength(hWnd);
+                if (length == 0) return true;
+                var windowTextBuilder = new StringBuilder(length + 1);
+                GetWindowText(hWnd, windowTextBuilder, windowTextBuilder.Capacity);
+                var windowTitle = windowTextBuilder.ToString();
+                if (windowTitle == "Program Manager") windowTitle = "Desktop and Icons";
+
+                // 获取进程信息
+                GetWindowThreadProcessId(hWnd, out int processId);
+                string processName = "";
+                try
+                {
+                    var process = Process.GetProcessById(processId);
+                    processName = process.ProcessName;
+                }
+                catch { }
+
+                windows.Add(new WindowDetails
+                {
+                    Handle = hWnd,
+                    Title = windowTitle,
+                    ProcessName = processName,
+                    ProcessId = processId
+                });
+                return true;
+            }, IntPtr.Zero);
+            return windows;
+        }
+
+        // 获取窗口的进程名
+        public static string GetWindowProcessName(IntPtr hWnd)
+        {
+            try
+            {
+                GetWindowThreadProcessId(hWnd, out int processId);
+                var process = Process.GetProcessById(processId);
+                return process.ProcessName;
+            }
+            catch
+            {
+                return "";
+            }
+        }
+
         public static Int32 GetWindowDisplayAffinity(IntPtr hWnd)
         {
             GetWindowDisplayAffinity(hWnd, out Int32 dwAffinity);
@@ -73,6 +138,8 @@ namespace WindowSharingHider
         {
             GetWindowThreadProcessId(hWnd, out Int32 procId);
             var procHandle = OpenProcess(0x38, true, procId);
+            if (procHandle == IntPtr.Zero) return;
+
             if (!IsWow64Process(procHandle, out bool is32Bit)) is32Bit = IntPtr.Size == 4;
 
             var ptrs = new IntPtr[0];
@@ -114,6 +181,12 @@ namespace WindowSharingHider
                 }
             }
 
+            if (SetWindowDisplayAffinityAddr == 0)
+            {
+                CloseHandle(procHandle);
+                return;
+            }
+
             var asm = new List<Byte>();
             if (is32Bit)
             {
@@ -143,10 +216,20 @@ namespace WindowSharingHider
             }
             asm.Add(0xC3); // ret
             var codePtr = VirtualAllocEx(procHandle, IntPtr.Zero, asm.Count, 0x1000, 0x40);
+            if (codePtr == IntPtr.Zero)
+            {
+                CloseHandle(procHandle);
+                return;
+            }
+
             WriteProcessMemory(procHandle, codePtr, asm.ToArray(), asm.Count, out Int32 bytesWritten);
 
             var thread = CreateRemoteThread(procHandle, IntPtr.Zero, 0, codePtr, IntPtr.Zero, 0, IntPtr.Zero);
-            WaitForSingleObject(thread, 10000);
+            if (thread != IntPtr.Zero)
+            {
+                WaitForSingleObject(thread, 10000);
+                CloseHandle(thread);
+            }
             VirtualFreeEx(procHandle, codePtr, 0, 0x8000);
             CloseHandle(procHandle);
         }
